@@ -7,6 +7,7 @@ import "core:odin/ast"
 import "core:odin/parser"
 import path "core:path/slashpath"
 import "core:strings"
+import "core:log"
 
 keyword_map: map[string]struct{} = {
 	"typeid"        = {},
@@ -563,51 +564,46 @@ get_ast_node_string :: proc(node: ^ast.Node, src: string) -> string {
 	return string(src[node.pos.offset:node.end.offset])
 }
 
-get_doc :: proc(comment: ^ast.Comment_Group, allocator: mem.Allocator) -> string {
-	if comment == nil {
-		return ""
-	}
+// The length of `/*`, `//` or `*/`
+COMMENT_DELIMITER_LENGTH :: 2
+#assert(len("//") == COMMENT_DELIMITER_LENGTH)
+#assert(len("/*") == COMMENT_DELIMITER_LENGTH)
+#assert(len("*/") == COMMENT_DELIMITER_LENGTH)
+
+// Aggregates the content from the provided comment group,
+// omitting extraneous spaces and delimiters.
+get_comment :: proc(comment: ^ast.Comment_Group, allocator := context.allocator) -> string {
+	if comment == nil do return ""
 
 	tmp: string
+	
+	for token in comment.list {
+		delimiter := token.text[:COMMENT_DELIMITER_LENGTH]
 
-	for doc in comment.list {
-		if strings.starts_with(doc.text, "/*") && doc.pos.column != 1 {
-			lines := strings.split(doc.text, "\n", context.temp_allocator)
-			for line, i in lines {
-				if i != 0 && len(line) > 0 {
-					column := 0
-					for column < doc.pos.column - 1 {
-						if line[column] == '\t' || line[column] == ' ' {
-							column += 1
-						} else {
-							break
-						}
-					}
-					tmp = strings.concatenate({tmp, "\n", line[column:]}, context.temp_allocator)
-				} else {
-					tmp = strings.concatenate({tmp, "\n", line}, context.temp_allocator)
-				}
+		switch delimiter {
+		case "/*": 
+			// TODO: account for cases like `/*squashed*/`
+			N :: COMMENT_DELIMITER_LENGTH + 1 // include the newline characters
+			content := token.text[N:len(token.text)-N] 
+			lines := strings.split_lines(content, context.temp_allocator)
+			for line in lines {
+				offset := min(max(token.pos.column - 1, 0), len(line))
+				tmp = strings.concatenate({tmp, "\n", line[offset:]}, context.temp_allocator)
 			}
-		} else {
-			tmp = strings.concatenate({tmp, "\n", doc.text}, context.temp_allocator)
+
+		case "//":
+			text := token.text[COMMENT_DELIMITER_LENGTH:]
+			// FIXME: indentation needs to be preserved
+			text = strings.trim_space(text) 
+			tmp = strings.concatenate({tmp, "\n", text}, context.temp_allocator)
+
+		case:
+			log.error("unsupported comment delimiter")
 		}
 	}
+	if tmp == "" do return ""
 
-	if tmp != "" {
-		no_lines, _ := strings.replace_all(tmp, "//", "", context.temp_allocator)
-		no_begin_comments, _ := strings.replace_all(no_lines, "/*", "", context.temp_allocator)
-		no_end_comments, _ := strings.replace_all(no_begin_comments, "*/", "", context.temp_allocator)
-		return strings.clone(no_end_comments, allocator)
-	}
-
-	return ""
-}
-
-get_comment :: proc(comment: ^ast.Comment_Group) -> string {
-	if comment != nil && len(comment.list) > 0 {
-		return comment.list[0].text
-	}
-	return ""
+	return strings.clone(tmp, allocator)
 }
 
 free_ast :: proc {
