@@ -101,14 +101,19 @@ visit_comment :: proc(p: ^Printer, comment: tokenizer.Token) -> (int, ^Document)
 			return 1, empty()
 		} else if comment.pos.line == p.source_position.line && p.source_position.column != 1 {
 			p.source_position = comment.pos
+			// Check for comment alignment padding
+			padding_doc := empty()
+			if padding, has_padding := p.comment_alignment[comment.pos.line]; has_padding {
+				padding_doc = repeat_space(padding)
+			}
 			if comment_option, exist := p.comments_option[comment.pos.line]; exist && comment_option == .Indent {
 				delete_key(&p.comments_option, comment.pos.line)
 				return newlines_before_comment, cons_with_nopl(
 					document,
-					cons(text(p.indentation), line_suffix(comment.text)),
+					cons(padding_doc, text(p.indentation), line_suffix(comment.text)),
 				)
 			} else {
-				return newlines_before_comment, cons_with_nopl(document, line_suffix(comment.text))
+				return newlines_before_comment, cons_with_nopl(document, cons(padding_doc, line_suffix(comment.text)))
 			}
 		} else {
 			p.source_position = comment.pos
@@ -208,7 +213,7 @@ visit_disabled :: proc(p: ^Printer, node: ^ast.Node) -> ^Document {
 }
 
 @(private)
-visit_decl :: proc(p: ^Printer, decl: ^ast.Decl, called_in_stmt := false) -> ^Document {
+visit_decl :: proc(p: ^Printer, decl: ^ast.Decl, called_in_stmt := false, name_alignment := 0) -> ^Document {
 	using ast
 
 	if decl == nil {
@@ -319,6 +324,15 @@ visit_decl :: proc(p: ^Printer, decl: ^ast.Decl, called_in_stmt := false) -> ^Do
 		}
 
 		lhs = cons(lhs, visit_exprs(p, v.names, {.Add_Comma, .Glue}))
+
+		// Add alignment padding if requested
+		if name_alignment > 0 && p.config.align_consecutive_declarations {
+			current_length := get_value_decl_name_length(v)
+			padding := name_alignment - current_length
+			if padding > 0 {
+				lhs = cons(lhs, repeat_space(padding))
+			}
+		}
 
 		if v.type != nil {
 			lhs = cons(lhs, text(" :" if p.config.spaces_around_colons else ":"))
@@ -2026,20 +2040,114 @@ visit_end_brace :: proc(p: ^Printer, end: tokenizer.Pos, limit := 0) -> ^Documen
 visit_block_stmts :: proc(p: ^Printer, stmts: []^ast.Stmt) -> ^Document {
 	document := empty()
 
-	for stmt, i in stmts {
-		last_index := max(0, i - 1)
-		if stmts[last_index].end.line == stmt.pos.line && i != 0 && stmt.pos.line not_in p.disabled_lines {
-			document = group(cons(document, break_with("; ")))
+	if p.config.align_consecutive_declarations {
+		// Process statements with alignment grouping
+		value_decl_group_start: Maybe(int)
+
+		for stmt, i in stmts {
+			if is_simple_value_decl(stmt) {
+				// First value decl in this group.
+				if value_decl_group_start == nil {
+					value_decl_group_start = i
+					continue
+				}
+
+				// If this value decl is on adjacent line(s), it is part of the group.
+				if stmt.pos.line - stmts[i - 1].end.line <= p.config.newline_limit {
+					continue
+				}
+
+				// This is a value decl, but it is separated, process the current group.
+				document = visit_aligned_block_stmts(p, document, stmts[value_decl_group_start.?:i])
+				value_decl_group_start = i
+			} else {
+				// Not a simple value decl, process any pending value decl group.
+				if value_decl_group_start != nil {
+					document = visit_aligned_block_stmts(p, document, stmts[value_decl_group_start.?:i])
+					value_decl_group_start = nil
+				}
+
+				last_index := max(0, i - 1)
+				if stmts[last_index].end.line == stmt.pos.line && i != 0 && stmt.pos.line not_in p.disabled_lines {
+					document = group(cons(document, break_with("; ")))
+				}
+
+				if p.force_statement_fit {
+					document = cons(document, enforce_fit(visit_stmt(p, stmt, .Generic, false, true)))
+				} else {
+					document = cons(document, visit_stmt(p, stmt, .Generic, false, true))
+				}
+			}
 		}
 
-		if p.force_statement_fit {
-			document = cons(document, enforce_fit(visit_stmt(p, stmt, .Generic, false, true)))
-		} else {
-			document = cons(document, visit_stmt(p, stmt, .Generic, false, true))
+		// Process any remaining value decl group.
+		if value_decl_group_start != nil {
+			document = visit_aligned_block_stmts(p, document, stmts[value_decl_group_start.?:])
+		}
+	} else {
+		for stmt, i in stmts {
+			last_index := max(0, i - 1)
+			if stmts[last_index].end.line == stmt.pos.line && i != 0 && stmt.pos.line not_in p.disabled_lines {
+				document = group(cons(document, break_with("; ")))
+			}
+
+			if p.force_statement_fit {
+				document = cons(document, enforce_fit(visit_stmt(p, stmt, .Generic, false, true)))
+			} else {
+				document = cons(document, visit_stmt(p, stmt, .Generic, false, true))
+			}
 		}
 	}
 
 	return document
+}
+
+// Helper to process a group of aligned statements in a block
+@(private)
+visit_aligned_block_stmts :: proc(p: ^Printer, document: ^Document, stmts: []^ast.Stmt) -> ^Document {
+	if len(stmts) == 0 {
+		return document
+	}
+
+	doc := document
+	alignment := get_consecutive_decl_alignment(stmts)
+
+	// Calculate comment alignment if enabled
+	if p.config.align_trailing_comments {
+		max_width := get_consecutive_decl_comment_alignment(stmts, alignment)
+		// Set comment padding for each line based on difference from max width
+		for stmt in stmts {
+			if value_decl, ok := stmt.derived.(^ast.Value_Decl); ok {
+				this_width := get_value_decl_full_width(value_decl, alignment)
+				padding := max_width - this_width
+				if padding > 0 {
+					p.comment_alignment[stmt.pos.line] = padding
+				}
+			}
+		}
+	}
+
+	for stmt, i in stmts {
+		last_index := max(0, i - 1)
+		if i > 0 && stmts[last_index].end.line == stmt.pos.line && stmt.pos.line not_in p.disabled_lines {
+			doc = group(cons(doc, break_with("; ")))
+		}
+
+		if p.force_statement_fit {
+			doc = cons(doc, enforce_fit(visit_decl(p, cast(^ast.Decl)stmt, true, alignment)))
+		} else {
+			doc = cons(doc, visit_decl(p, cast(^ast.Decl)stmt, true, alignment))
+		}
+	}
+
+	// Clear comment alignment after processing
+	if p.config.align_trailing_comments {
+		for stmt in stmts {
+			delete_key(&p.comment_alignment, stmt.pos.line)
+		}
+	}
+
+	return doc
 }
 
 List_Option :: enum u8 {
@@ -2542,4 +2650,116 @@ get_possible_bit_field_alignment :: proc(fields: []^ast.Bit_Field_Field) -> (lon
 	}
 
 	return
+}
+
+// Calculate the length of the LHS of a value declaration (names only)
+@(private)
+get_value_decl_name_length :: proc(decl: ^ast.Value_Decl) -> int {
+	length := 0
+	for name, i in decl.names {
+		length += get_node_length(name)
+		if i < len(decl.names) - 1 {
+			length += 2 // ", "
+		}
+	}
+	if decl.is_using {
+		length += 6 // "using "
+	}
+	return length
+}
+
+// Calculate alignment for a group of consecutive value declarations
+// Returns the longest name length for aligning the `:` or `::`
+get_consecutive_decl_alignment :: proc(decls: []^ast.Stmt) -> int {
+	longest_name := 0
+
+	for decl in decls {
+		if value_decl, ok := decl.derived.(^ast.Value_Decl); ok {
+			length := get_value_decl_name_length(value_decl)
+			longest_name = max(longest_name, length)
+		}
+	}
+
+	return longest_name
+}
+
+// Check if a value declaration is "simple" (single-line, no complex values like procs)
+is_simple_value_decl :: proc(decl: ^ast.Stmt) -> bool {
+	value_decl, is_value := decl.derived.(^ast.Value_Decl)
+	if !is_value {
+		return false
+	}
+
+	// Multi-line declarations are not simple
+	if decl.end.line != decl.pos.line {
+		return false
+	}
+
+	// Check if any value is a complex expression (proc literal, struct literal with body, etc.)
+	for value in value_decl.values {
+		#partial switch v in value.derived {
+		case ^ast.Proc_Lit:
+			return false
+		case ^ast.Comp_Lit:
+			// Comp lits that span multiple lines are not simple
+			if value.end.line != value.pos.line {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// Calculate the full width of a value declaration statement (for trailing comment alignment)
+// This calculates: name_padding + name + ": " or ":: " + type (if any) + "= " or ": " (if values) + values
+get_value_decl_full_width :: proc(decl: ^ast.Value_Decl, name_alignment: int) -> int {
+	width := 0
+
+	// Name(s) with alignment padding
+	name_length := get_value_decl_name_length(decl)
+	width += name_alignment // Use the aligned width, not actual
+
+	// ": " or ":: "
+	if decl.type != nil {
+		width += 2 // ": "
+		width += get_node_length(decl.type)
+	} else if !decl.is_mutable {
+		width += 2 // "::"
+	} else {
+		width += 1 // ":"
+	}
+
+	// Values
+	if len(decl.values) > 0 {
+		if decl.is_mutable {
+			width += 2 // "= " or ": " after type
+		} else if decl.type != nil {
+			width += 2 // ": " for constant with type
+		}
+
+		for value, i in decl.values {
+			width += get_node_length(value)
+			if i < len(decl.values) - 1 {
+				width += 2 // ", "
+			}
+		}
+	}
+
+	return width
+}
+
+// Calculate trailing comment alignment for a group of consecutive declarations
+// Returns the max statement width for aligning comments
+get_consecutive_decl_comment_alignment :: proc(decls: []^ast.Stmt, name_alignment: int) -> int {
+	max_width := 0
+
+	for decl in decls {
+		if value_decl, ok := decl.derived.(^ast.Value_Decl); ok {
+			width := get_value_decl_full_width(value_decl, name_alignment)
+			max_width = max(max_width, width)
+		}
+	}
+
+	return max_width
 }

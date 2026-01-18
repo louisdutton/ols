@@ -31,6 +31,8 @@ Printer :: struct {
 	force_statement_fit:  bool,
 	src:                  string,
 	errored_out:          bool,
+	// For trailing comment alignment: maps line number to desired comment column
+	comment_alignment:    map[int]int,
 }
 
 Disabled_Info :: struct {
@@ -53,9 +55,11 @@ Config :: struct {
 	sort_imports:             bool,
 	inline_single_stmt_case:  bool,
 	spaces_around_colons:     bool, //Put spaces to the left of a colon as well as the right. `foo: bar` => `foo : bar`
-	space_single_line_blocks: bool,
-	align_struct_fields:      bool,
-	align_struct_values:      bool,
+	space_single_line_blocks:       bool,
+	align_struct_fields:            bool,
+	align_struct_values:            bool,
+	align_consecutive_declarations: bool, // Align `=` and `:` in consecutive variable/constant declarations
+	align_trailing_comments:        bool, // Align trailing comments to the same column
 }
 
 Brace_Style :: enum {
@@ -94,35 +98,39 @@ Line_Suffix_Option :: enum {
 
 when ODIN_OS == .Windows {
 	default_style := Config {
-		spaces               = 4,
-		newline_limit        = 2,
-		convert_do           = false,
-		tabs                 = true,
-		tabs_width           = 4,
-		brace_style          = ._1TBS,
-		indent_cases         = false,
-		newline_style        = .CRLF,
-		character_width      = 100,
-		sort_imports         = true,
-		spaces_around_colons = false,
-		align_struct_fields  = true,
-		align_struct_values  = true,
+		spaces                         = 4,
+		newline_limit                  = 2,
+		convert_do                     = false,
+		tabs                           = true,
+		tabs_width                     = 4,
+		brace_style                    = ._1TBS,
+		indent_cases                   = false,
+		newline_style                  = .CRLF,
+		character_width                = 100,
+		sort_imports                   = true,
+		spaces_around_colons           = false,
+		align_struct_fields            = true,
+		align_struct_values            = true,
+		align_consecutive_declarations = false,
+		align_trailing_comments        = false,
 	}
 } else {
 	default_style := Config {
-		spaces               = 4,
-		newline_limit        = 2,
-		convert_do           = false,
-		tabs                 = true,
-		tabs_width           = 4,
-		brace_style          = ._1TBS,
-		indent_cases         = false,
-		newline_style        = .LF,
-		character_width      = 100,
-		sort_imports         = true,
-		spaces_around_colons = false,
-		align_struct_fields  = true,
-		align_struct_values  = true,
+		spaces                         = 4,
+		newline_limit                  = 2,
+		convert_do                     = false,
+		tabs                           = true,
+		tabs_width                     = 4,
+		brace_style                    = ._1TBS,
+		indent_cases                   = false,
+		newline_style                  = .LF,
+		character_width                = 100,
+		sort_imports                   = true,
+		spaces_around_colons           = false,
+		align_struct_fields            = true,
+		align_struct_values            = true,
+		align_consecutive_declarations = false,
+		align_trailing_comments        = false,
 	}
 }
 
@@ -236,6 +244,8 @@ print_file :: proc(p: ^Printer, file: ^ast.File) -> string {
 
 	// Keep track of the first import in a row, to sort them later.
 	import_group_start: Maybe(int)
+	// Keep track of the first value decl in a row, to align them.
+	value_decl_group_start: Maybe(int)
 
 	prev_decl: ^ast.Stmt
 	for decl, i in file.decls {
@@ -266,11 +276,47 @@ print_file :: proc(p: ^Printer, file: ^ast.File) -> string {
 				import_group_start = nil
 			}
 
-			if prev_decl != nil && prev_decl.end.line == decl.pos.line && decl.pos.line not_in p.disabled_lines {
-				p.document = cons(p.document, break_with("; "))
+			// Handle consecutive value declaration alignment
+			if p.config.align_consecutive_declarations {
+				if is_simple_value_decl(decl) {
+					// First value decl in this group.
+					if value_decl_group_start == nil {
+						value_decl_group_start = i
+						continue
+					}
+
+					// If this value decl is on adjacent line(s), it is part of the group.
+					if decl.pos.line - file.decls[i - 1].end.line <= p.config.newline_limit {
+						continue
+					}
+
+					// This is a value decl, but it is separated, print the current group.
+					print_aligned_value_decls(p, file.decls[value_decl_group_start.?:i])
+					value_decl_group_start = i
+				} else {
+					// Not a simple value decl, print any pending value decl group.
+					if value_decl_group_start != nil {
+						print_aligned_value_decls(p, file.decls[value_decl_group_start.?:i])
+						value_decl_group_start = nil
+					}
+
+					if prev_decl != nil && prev_decl.end.line == decl.pos.line && decl.pos.line not_in p.disabled_lines {
+						p.document = cons(p.document, break_with("; "))
+					}
+					p.document = cons(p.document, visit_decl(p, decl))
+				}
+			} else {
+				if prev_decl != nil && prev_decl.end.line == decl.pos.line && decl.pos.line not_in p.disabled_lines {
+					p.document = cons(p.document, break_with("; "))
+				}
+				p.document = cons(p.document, visit_decl(p, decl))
 			}
-			p.document = cons(p.document, visit_decl(p, decl))
 		}
+	}
+
+	// Print any remaining value decl group.
+	if value_decl_group_start != nil {
+		print_aligned_value_decls(p, file.decls[value_decl_group_start.?:])
 	}
 
 	if p.errored_out {
@@ -320,5 +366,50 @@ print_sorted_imports :: proc(p: ^Printer, decls: []^ast.Stmt) {
 		}
 
 		p.document = cons(p.document, visit_decl(p, cast(^ast.Decl)decl))
+	}
+}
+
+// Print aligned consecutive value declarations.
+@(private)
+print_aligned_value_decls :: proc(p: ^Printer, decls: []^ast.Stmt) {
+	if len(decls) == 0 {
+		return
+	}
+
+	// Calculate name alignment for the group
+	alignment := get_consecutive_decl_alignment(decls)
+
+	// Calculate comment alignment if enabled
+	if p.config.align_trailing_comments {
+		max_width := get_consecutive_decl_comment_alignment(decls, alignment)
+		// Set comment padding for each line based on difference from max width
+		for decl in decls {
+			if value_decl, ok := decl.derived.(^ast.Value_Decl); ok {
+				this_width := get_value_decl_full_width(value_decl, alignment)
+				padding := max_width - this_width
+				if padding > 0 {
+					p.comment_alignment[decl.pos.line] = padding
+				}
+			}
+		}
+	}
+
+	prev_decl: ^ast.Stmt
+	for decl, i in decls {
+		defer {
+			prev_decl = decl
+		}
+
+		if prev_decl != nil && prev_decl.end.line == decl.pos.line && decl.pos.line not_in p.disabled_lines {
+			p.document = cons(p.document, break_with("; "))
+		}
+		p.document = cons(p.document, visit_decl(p, cast(^ast.Decl)decl, false, alignment))
+	}
+
+	// Clear comment alignment after processing
+	if p.config.align_trailing_comments {
+		for decl in decls {
+			delete_key(&p.comment_alignment, decl.pos.line)
+		}
 	}
 }
